@@ -28,7 +28,7 @@ async fn main() -> Result<(), XhttpError> {
     let status = get_status();
     let ssh_port = get_ssh_port();
 
-    println!("[BDRProxy] xHTTP v3.3.6 (DTunnel Force Mode)");
+    println!("[BDRProxy] xHTTP v3.3.7 (DTunnel Ultra-Fast Mode)");
     println!("[xHTTP] Porta: {} | SSH Backend: 127.0.0.1:{}", port, ssh_port);
 
     let listener = TcpListener::bind(format!("[::]:{}", port)).await.map_err(|e| Box::new(e) as XhttpError)?;
@@ -90,14 +90,13 @@ async fn handle_tls_dual(stream: TcpStream, status: &str, ssh_port: u16) -> Resu
     let data = &buf[..n];
     let http_str = String::from_utf8_lossy(data);
     
-    if http_str.contains("x-session-id") || http_str.contains("/ssh/") || http_str.contains("/xhttp/") ||
-       (http_str.contains("GET ") && http_str.contains("HTTP/1.1")) {
-        if let Some((method, path)) = parse_http_request(&http_str) {
-            match method.as_str() {
-                "GET" => return handle_xhttp_get_tls(&mut tls_stream, &path, status, ssh_port).await,
-                "POST" => return handle_xhttp_post_tls(&mut tls_stream, data, &path, status).await,
-                _ => {}
-            }
+    if http_str.starts_with("GET ") {
+        if let Some((_, path)) = parse_http_request(&http_str) {
+            return handle_xhttp_get_tls(&mut tls_stream, &path, status, ssh_port).await;
+        }
+    } else if http_str.starts_with("POST ") {
+        if let Some((_, path)) = parse_http_request(&http_str) {
+            return handle_xhttp_post_tls(&mut tls_stream, data, &path, status).await;
         }
     }
 
@@ -115,14 +114,13 @@ async fn handle_http_dual_raw(mut stream: TcpStream, status: &str, ssh_port: u16
     let n = stream.read(&mut buf).await.map_err(|e| Box::new(e) as XhttpError)?;
     let http_str = String::from_utf8_lossy(&buf[..n]);
     
-    if http_str.contains("x-session-id") || http_str.contains("/ssh/") || http_str.contains("/xhttp/") ||
-       (http_str.contains("GET ") && http_str.contains("HTTP/1.1")) {
-        if let Some((method, path)) = parse_http_request(&http_str) {
-            match method.as_str() {
-                "GET" => return handle_xhttp_get_raw(&mut stream, &path, status, ssh_port).await,
-                "POST" => return handle_xhttp_post_raw(&mut stream, &buf[..n], &path, status).await,
-                _ => {}
-            }
+    if http_str.starts_with("GET ") {
+        if let Some((_, path)) = parse_http_request(&http_str) {
+            return handle_xhttp_get_raw(&mut stream, &path, status, ssh_port).await;
+        }
+    } else if http_str.starts_with("POST ") {
+        if let Some((_, path)) = parse_http_request(&http_str) {
+            return handle_xhttp_post_raw(&mut stream, &buf[..n], &path, status).await;
         }
     }
 
@@ -161,7 +159,9 @@ async fn handle_xhttp_get_tls(
     status: &str, 
     ssh_port: u16
 ) -> Result<(), XhttpError> {
-    let (sid, _) = extract_path_info(path);
+    let (mut sid, _) = extract_path_info(path);
+    if sid.is_empty() { sid = "default".to_string(); }
+    
     let ssh = TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await.map_err(|e| Box::new(e) as XhttpError)?;
     let (mut sr, mut sw) = ssh.into_split();
     let (ptx, mut prx) = mpsc::channel::<Vec<u8>>(1024);
@@ -175,6 +175,7 @@ async fn handle_xhttp_get_tls(
     
     let resp = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Session-ID: {}\r\nX-Status: {}\r\nConnection: keep-alive\r\n\r\n", sid, status);
     tls.write_all(resp.as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
+    let _ = tls.flush().await;
 
     let msg = "XHTTP download started\n";
     tls.write_all(format!("{:x}\r\n{}\r\n", msg.len(), msg).as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
@@ -190,7 +191,9 @@ async fn handle_xhttp_get_tls(
 }
 
 async fn handle_xhttp_get_raw(stream: &mut TcpStream, path: &str, status: &str, ssh_port: u16) -> Result<(), XhttpError> {
-    let (sid, _) = extract_path_info(path);
+    let (mut sid, _) = extract_path_info(path);
+    if sid.is_empty() { sid = "default".to_string(); }
+    
     let ssh = TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await.map_err(|e| Box::new(e) as XhttpError)?;
     let (mut sr, mut sw) = ssh.into_split();
     let (ptx, mut prx) = mpsc::channel::<Vec<u8>>(1024);
@@ -204,6 +207,7 @@ async fn handle_xhttp_get_raw(stream: &mut TcpStream, path: &str, status: &str, 
     
     let msg = "XHTTP download started\n";
     stream.write_all(format!("{:x}\r\n{}\r\n", msg.len(), msg).as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
+    let _ = stream.flush().await;
 
     while let Some(d) = grx.recv().await {
         if stream.write_all(format!("{:x}\r\n", d.len()).as_bytes()).await.is_err() { break; }
