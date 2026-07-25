@@ -28,7 +28,7 @@ async fn main() -> Result<(), XhttpError> {
     let status = get_status();
     let ssh_port = get_ssh_port();
 
-    println!("[BDRProxy] xHTTP v3.3.7 (DTunnel Ultra-Fast Mode)");
+    println!("[BDRProxy] xHTTP v3.3.8 (DTunnel Auth Optimization)");
     println!("[xHTTP] Porta: {} | SSH Backend: 127.0.0.1:{}", port, ssh_port);
 
     let listener = TcpListener::bind(format!("[::]:{}", port)).await.map_err(|e| Box::new(e) as XhttpError)?;
@@ -163,15 +163,16 @@ async fn handle_xhttp_get_tls(
     if sid.is_empty() { sid = "default".to_string(); }
     
     let ssh = TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await.map_err(|e| Box::new(e) as XhttpError)?;
+    let _ = ssh.set_nodelay(true);
     let (mut sr, mut sw) = ssh.into_split();
     let (ptx, mut prx) = mpsc::channel::<Vec<u8>>(1024);
     let (gtx, mut grx) = mpsc::channel::<Vec<u8>>(1024);
     let act = Arc::new(RwLock::new(true));
     SESSIONS.lock().await.insert(sid.clone(), XhttpSession { post_tx: ptx, get_tx: gtx.clone(), active: act.clone() });
     let act_c = act.clone();
-    tokio::spawn(async move { while let Some(d) = prx.recv().await { if !*act_c.read().await { break; } let _ = sw.write_all(&d).await; } });
+    tokio::spawn(async move { while let Some(d) = prx.recv().await { if !*act_c.read().await { break; } let _ = sw.write_all(&d).await; let _ = sw.flush().await; } });
     let gtx_c = gtx.clone();
-    tokio::spawn(async move { let mut b = vec![0u8; 16384]; while let Ok(Ok(n)) = timeout(Duration::from_secs(600), sr.read(&mut b)).await { if n == 0 || gtx_c.send(b[..n].to_vec()).await.is_err() { break; } } });
+    tokio::spawn(async move { let mut b = vec![0u8; 8192]; while let Ok(Ok(n)) = timeout(Duration::from_secs(600), sr.read(&mut b)).await { if n == 0 || gtx_c.send(b[..n].to_vec()).await.is_err() { break; } } });
     
     let resp = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Session-ID: {}\r\nX-Status: {}\r\nConnection: keep-alive\r\n\r\n", sid, status);
     tls.write_all(resp.as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
@@ -195,13 +196,14 @@ async fn handle_xhttp_get_raw(stream: &mut TcpStream, path: &str, status: &str, 
     if sid.is_empty() { sid = "default".to_string(); }
     
     let ssh = TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await.map_err(|e| Box::new(e) as XhttpError)?;
+    let _ = ssh.set_nodelay(true);
     let (mut sr, mut sw) = ssh.into_split();
     let (ptx, mut prx) = mpsc::channel::<Vec<u8>>(1024);
     let (gtx, mut grx) = mpsc::channel::<Vec<u8>>(1024);
     SESSIONS.lock().await.insert(sid.clone(), XhttpSession { post_tx: ptx, get_tx: gtx.clone(), active: Arc::new(RwLock::new(true)) });
-    tokio::spawn(async move { while let Some(d) = prx.recv().await { let _ = sw.write_all(&d).await; } });
+    tokio::spawn(async move { while let Some(d) = prx.recv().await { let _ = sw.write_all(&d).await; let _ = sw.flush().await; } });
     let gtx_c = gtx.clone();
-    tokio::spawn(async move { let mut b = vec![0u8; 16384]; while let Ok(Ok(n)) = timeout(Duration::from_secs(600), sr.read(&mut b)).await { if n == 0 || gtx_c.send(b[..n].to_vec()).await.is_err() { break; } } });
+    tokio::spawn(async move { let mut b = vec![0u8; 8192]; while let Ok(Ok(n)) = timeout(Duration::from_secs(600), sr.read(&mut b)).await { if n == 0 || gtx_c.send(b[..n].to_vec()).await.is_err() { break; } } });
     let resp = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Session-ID: {}\r\nX-Status: {}\r\n\r\n", sid, status);
     stream.write_all(resp.as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
     
@@ -219,7 +221,8 @@ async fn handle_xhttp_get_raw(stream: &mut TcpStream, path: &str, status: &str, 
 }
 
 async fn handle_xhttp_post_tls(tls: &mut tokio_rustls::server::TlsStream<TcpStream>, req: &[u8], path: &str, _: &str) -> Result<(), XhttpError> {
-    let (sid, _) = extract_path_info(path);
+    let (mut sid, _) = extract_path_info(path);
+    if sid.is_empty() { sid = "default".to_string(); }
     let cl = extract_content_length_from_bytes(req).unwrap_or(0);
     let h_end = req.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0) + 4;
     let mut body = req[h_end..].to_vec();
@@ -230,12 +233,15 @@ async fn handle_xhttp_post_tls(tls: &mut tokio_rustls::server::TlsStream<TcpStre
         body.extend_from_slice(&b[..n]);
     }
     if let Some(s) = SESSIONS.lock().await.get(&sid) { let _ = s.post_tx.send(body).await; }
-    tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.map_err(|e| Box::new(e) as XhttpError)?;
+    else if let Some(s) = SESSIONS.lock().await.get("default") { let _ = s.post_tx.send(body).await; }
+    tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n").await.map_err(|e| Box::new(e) as XhttpError)?;
+    let _ = tls.flush().await;
     Ok(())
 }
 
 async fn handle_xhttp_post_raw(stream: &mut TcpStream, req: &[u8], path: &str, _: &str) -> Result<(), XhttpError> {
-    let (sid, _) = extract_path_info(path);
+    let (mut sid, _) = extract_path_info(path);
+    if sid.is_empty() { sid = "default".to_string(); }
     let cl = extract_content_length_from_bytes(req).unwrap_or(0);
     let h_end = req.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0) + 4;
     let mut body = req[h_end..].to_vec();
@@ -246,7 +252,9 @@ async fn handle_xhttp_post_raw(stream: &mut TcpStream, req: &[u8], path: &str, _
         body.extend_from_slice(&b[..n]);
     }
     if let Some(s) = SESSIONS.lock().await.get(&sid) { let _ = s.post_tx.send(body).await; }
+    else if let Some(s) = SESSIONS.lock().await.get("default") { let _ = s.post_tx.send(body).await; }
     stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.map_err(|e| Box::new(e) as XhttpError)?;
+    let _ = stream.flush().await;
     Ok(())
 }
 
