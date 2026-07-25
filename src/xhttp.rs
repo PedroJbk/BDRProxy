@@ -28,7 +28,7 @@ async fn main() -> Result<(), XhttpError> {
     let status = get_status();
     let ssh_port = get_ssh_port();
 
-    println!("[BDRProxy] xHTTP v3.3.4 (XHTTP + SSL Payload Support)");
+    println!("[BDRProxy] xHTTP v3.3.5 (XHTTP + DTunnel + SSL Support)");
     println!("[xHTTP] Porta: {} | SSH Backend: 127.0.0.1:{}", port, ssh_port);
 
     let listener = TcpListener::bind(format!("[::]:{}", port)).await.map_err(|e| Box::new(e) as XhttpError)?;
@@ -90,10 +90,10 @@ async fn handle_tls_dual(stream: TcpStream, status: &str, ssh_port: u16) -> Resu
     let data = &buf[..n];
     let http_str = String::from_utf8_lossy(data);
     
-    if (http_str.contains("x-session-id") || http_str.contains("/ssh/") || http_str.contains("/xhttp/")) {
+    if http_str.contains("x-session-id") || http_str.contains("/ssh/") || http_str.contains("/xhttp/") {
         if let Some((method, path)) = parse_http_request(&http_str) {
             match method.as_str() {
-                "GET" => return handle_xhttp_get_tls(&mut tls_stream, &path, status, ssh_port).await,
+                "GET" => return handle_xhttp_get_tls(&mut tls_stream, &path, status, ssh_port, true).await,
                 "POST" => return handle_xhttp_post_tls(&mut tls_stream, data, &path, status).await,
                 _ => {}
             }
@@ -114,7 +114,7 @@ async fn handle_http_dual_raw(mut stream: TcpStream, status: &str, ssh_port: u16
     let n = stream.read(&mut buf).await.map_err(|e| Box::new(e) as XhttpError)?;
     let http_str = String::from_utf8_lossy(&buf[..n]);
     
-    if (http_str.contains("x-session-id") || http_str.contains("/ssh/") || http_str.contains("/xhttp/")) {
+    if http_str.contains("x-session-id") || http_str.contains("/ssh/") || http_str.contains("/xhttp/") {
         if let Some((method, path)) = parse_http_request(&http_str) {
             match method.as_str() {
                 "GET" => return handle_xhttp_get_raw(&mut stream, &path, status, ssh_port).await,
@@ -153,7 +153,13 @@ async fn handle_ssh_direct_tls(tls_stream: tokio_rustls::server::TlsStream<TcpSt
     Ok(())
 }
 
-async fn handle_xhttp_get_tls(tls: &mut tokio_rustls::server::TlsStream<TcpStream>, path: &str, status: &str, ssh_port: u16) -> Result<(), XhttpError> {
+async fn handle_xhttp_get_tls(
+    tls: &mut tokio_rustls::server::TlsStream<TcpStream>, 
+    path: &str, 
+    status: &str, 
+    ssh_port: u16,
+    is_dtunnel: bool
+) -> Result<(), XhttpError> {
     let (sid, _) = extract_path_info(path);
     let ssh = TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await.map_err(|e| Box::new(e) as XhttpError)?;
     let (mut sr, mut sw) = ssh.into_split();
@@ -165,8 +171,16 @@ async fn handle_xhttp_get_tls(tls: &mut tokio_rustls::server::TlsStream<TcpStrea
     tokio::spawn(async move { while let Some(d) = prx.recv().await { if !*act_c.read().await { break; } let _ = sw.write_all(&d).await; } });
     let gtx_c = gtx.clone();
     tokio::spawn(async move { let mut b = vec![0u8; 16384]; while let Ok(Ok(n)) = timeout(Duration::from_secs(600), sr.read(&mut b)).await { if n == 0 || gtx_c.send(b[..n].to_vec()).await.is_err() { break; } } });
-    let resp = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Session-ID: {}\r\nX-Status: {}\r\n\r\n", sid, status);
+    
+    let resp = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Session-ID: {}\r\nX-Status: {}\r\nConnection: keep-alive\r\n\r\n", sid, status);
     tls.write_all(resp.as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
+
+    if is_dtunnel {
+        let msg = "XHTTP download started\n";
+        tls.write_all(format!("{:x}\r\n{}\r\n", msg.len(), msg).as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
+        let _ = tls.flush().await;
+    }
+
     while let Some(d) = grx.recv().await {
         if tls.write_all(format!("{:x}\r\n", d.len()).as_bytes()).await.is_err() { break; }
         if tls.write_all(&d).await.is_err() { break; }
@@ -265,4 +279,3 @@ fn build_tls_config(cp: &str, kp: &str) -> Result<rustls::ServerConfig, XhttpErr
 fn get_port() -> u16 { std::env::args().enumerate().find(|(_, a)| a == "--port" || a == "-p").and_then(|(i, _)| std::env::args().nth(i+1)).and_then(|a| a.parse().ok()).unwrap_or(443) }
 fn get_ssh_port() -> u16 { std::env::args().enumerate().find(|(_, a)| a == "--ssh-port").and_then(|(i, _)| std::env::args().nth(i+1)).and_then(|a| a.parse().ok()).unwrap_or(22) }
 fn get_status() -> String { std::env::args().enumerate().find(|(_, a)| a == "--status" || a == "-s").and_then(|(i, _)| std::env::args().nth(i+1)).unwrap_or("@SDProxy".to_string()) }
-fn generate_session_id() -> String { format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()) }
