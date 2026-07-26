@@ -28,7 +28,7 @@ async fn main() -> Result<(), XhttpError> {
     let status = get_status();
     let ssh_port = get_ssh_port();
 
-    println!("[BDRProxy] xHTTP v3.3.9 (DTunnel Stability Mode)");
+    println!("[BDRProxy] xHTTP v3.4.0 (DTunnel Final Fix)");
     println!("[xHTTP] Porta: {} | SSH Backend: 127.0.0.1:{}", port, ssh_port);
 
     let listener = TcpListener::bind(format!("[::]:{}", port)).await.map_err(|e| Box::new(e) as XhttpError)?;
@@ -37,10 +37,14 @@ async fn main() -> Result<(), XhttpError> {
     loop {
         match listener.accept().await {
             Ok((client_stream, addr)) => {
+                let _ = client_stream.set_nodelay(true);
                 let status = status_arc.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_xhttp_client(client_stream, &status, ssh_port).await {
-                        println!("[xHTTP] Erro em {}: {}", addr, e);
+                        let err_str = e.to_string();
+                        if !err_str.contains("Broken pipe") && !err_str.contains("Connection reset") {
+                            println!("[xHTTP] Info {}: {}", addr, e);
+                        }
                     }
                 });
             }
@@ -57,7 +61,7 @@ async fn handle_xhttp_client(
     ssh_port: u16,
 ) -> Result<(), XhttpError> {
     let mut peek_buf = [0u8; 3];
-    let peek_result = timeout(Duration::from_secs(10), stream.peek(&mut peek_buf)).await;
+    let peek_result = timeout(Duration::from_secs(5), stream.peek(&mut peek_buf)).await;
     let bytes_peeked = match peek_result {
         Ok(Ok(n)) => n,
         _ => return Ok(()),
@@ -66,12 +70,10 @@ async fn handle_xhttp_client(
     if bytes_peeked == 0 { return Ok(()); }
     let first_byte = peek_buf[0];
 
-    // Detecta TLS (0x16 = TLS ClientHello)
     if first_byte == 0x16 {
         return handle_tls_dual(stream, status, ssh_port).await;
     }
 
-    // Detecta se parece ser HTTP
     if first_byte >= 0x41 && first_byte <= 0x5A {
         return handle_http_dual_raw(stream, status, ssh_port).await;
     }
@@ -92,7 +94,7 @@ async fn handle_tls_dual(
     let mut tls_stream = acceptor.accept(stream).await.map_err(|e| Box::new(e) as XhttpError)?;
 
     let mut buf = vec![0u8; 4096];
-    let n = match timeout(Duration::from_secs(5), tls_stream.read(&mut buf)).await {
+    let n = match timeout(Duration::from_secs(3), tls_stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => n,
         _ => return handle_ssh_direct_tls(tls_stream, ssh_port, None).await,
     };
@@ -100,7 +102,6 @@ async fn handle_tls_dual(
     let data = &buf[..n];
     let http_str = String::from_utf8_lossy(data);
     
-    // Detecção simplificada para garantir o marcador no DTunnel
     if http_str.contains("GET ") {
         if let Some((_, path)) = parse_http_request(&http_str) {
             return handle_xhttp_get_tls(&mut tls_stream, &path, status, ssh_port).await;
@@ -111,7 +112,6 @@ async fn handle_tls_dual(
         }
     }
 
-    // Resposta HTTP para túneis com payload
     if http_str.contains("HTTP/1.") {
         let resp = format!("HTTP/1.1 101 ({})\r\n\r\nHTTP/1.1 200 ({})\r\n\r\n", status, status);
         tls_stream.write_all(resp.as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
@@ -178,21 +178,22 @@ async fn handle_xhttp_get_tls(
     let (mut sid, _) = extract_path_info(path);
     if sid.is_empty() { sid = "default".to_string(); }
     
-    let mut ssh = TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await.map_err(|e| Box::new(e) as XhttpError)?;
+    let ssh = TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await.map_err(|e| Box::new(e) as XhttpError)?;
     let _ = ssh.set_nodelay(true);
+    let (mut sr, mut sw) = ssh.into_split();
     
     let (ptx, mut prx) = mpsc::channel::<Vec<u8>>(1024);
     let (gtx, mut grx) = mpsc::channel::<Vec<u8>>(1024);
     let act = Arc::new(RwLock::new(true));
     SESSIONS.lock().await.insert(sid.clone(), XhttpSession { post_tx: ptx, get_tx: gtx.clone(), active: act.clone() });
     
-    let (mut sr, mut sw) = ssh.into_split();
     let act_c = act.clone();
     tokio::spawn(async move { 
         while let Some(d) = prx.recv().await { 
             if !*act_c.read().await { break; } 
             if sw.write_all(&d).await.is_err() { break; }
         } 
+        let _ = sw.shutdown().await;
     });
     
     let gtx_c = gtx.clone();
@@ -203,11 +204,25 @@ async fn handle_xhttp_get_tls(
         } 
     });
 
-    // Resposta imediata para restaurar o marcador
-    let resp = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Session-ID: {}\r\nX-Status: {}\r\nConnection: keep-alive\r\n\r\n", sid, status);
+    // DTUNNEL Fix: Cabeçalhos estritos do LKProxy
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Connection: keep-alive\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Transfer-Encoding: chunked\r\n\
+         Cache-Control: no-store, no-cache, must-revalidate\r\n\
+         Pragma: no-cache\r\n\
+         Expires: 0\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Session-ID: {}\r\n\
+         X-Status: {}\r\n\r\n", 
+        sid, status
+    );
+    
     tls.write_all(resp.as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
-    let _ = tls.flush().await;
+    tls.flush().await?;
 
+    // Marcador DTunnel
     let msg = "XHTTP download started\n";
     tls.write_all(format!("{:x}\r\n{}\r\n", msg.len(), msg).as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
     let _ = tls.flush().await;
@@ -218,6 +233,10 @@ async fn handle_xhttp_get_tls(
         if tls.write_all(b"\r\n").await.is_err() { break; }
         let _ = tls.flush().await;
     }
+    
+    let mut lock = SESSIONS.lock().await;
+    if let Some(s) = lock.get(&sid) { *s.active.write().await = false; }
+    lock.remove(&sid);
     Ok(())
 }
 
@@ -225,7 +244,7 @@ async fn handle_xhttp_get_raw(stream: &mut TcpStream, path: &str, status: &str, 
     let (mut sid, _) = extract_path_info(path);
     if sid.is_empty() { sid = "default".to_string(); }
     
-    let mut ssh = TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await.map_err(|e| Box::new(e) as XhttpError)?;
+    let ssh = TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await.map_err(|e| Box::new(e) as XhttpError)?;
     let _ = ssh.set_nodelay(true);
     let (mut sr, mut sw) = ssh.into_split();
     
@@ -247,7 +266,15 @@ async fn handle_xhttp_get_raw(stream: &mut TcpStream, path: &str, status: &str, 
         } 
     });
     
-    let resp = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Session-ID: {}\r\nX-Status: {}\r\n\r\n", sid, status);
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Connection: keep-alive\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Transfer-Encoding: chunked\r\n\
+         X-Session-ID: {}\r\n\
+         X-Status: {}\r\n\r\n", 
+        sid, status
+    );
     stream.write_all(resp.as_bytes()).await.map_err(|e| Box::new(e) as XhttpError)?;
     
     let msg = "XHTTP download started\n";
@@ -344,7 +371,12 @@ fn build_tls_config(cp: &str, kp: &str) -> Result<rustls::ServerConfig, XhttpErr
     let keys: Vec<PrivateKey> = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(std::fs::File::open(kp).map_err(|e| Box::new(e) as XhttpError)?)).map_err(|e| Box::new(e) as XhttpError)?.into_iter().map(PrivateKey).collect();
     if certs.is_empty() || keys.is_empty() { return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Certs empty")) as XhttpError); }
     let mut c = rustls::ServerConfig::builder().with_safe_defaults().with_no_client_auth().with_single_cert(certs, keys.into_iter().next().unwrap()).map_err(|e| Box::new(e) as XhttpError)?;
-    c.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
+    
+    c.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    
+    // DTUNNEL Force: Apenas TLSv1.2 e TLSv1.3
+    c.versions = vec![rustls::ProtocolVersion::TLSv1_2, rustls::ProtocolVersion::TLSv1_3];
+    
     Ok(c)
 }
 
