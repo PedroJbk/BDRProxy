@@ -375,7 +375,9 @@ fn build_tls_config(cp: &str, kp: &str) -> Result<rustls::ServerConfig, XhttpErr
     c.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     
     // DTUNNEL Force: Apenas TLSv1.2 e TLSv1.3
-    c.versions = vec![rustls::ProtocolVersion::TLSv1_2, rustls::ProtocolVersion::TLSv1_3];
+    // Nota: Em rustls 0.21, as versões são configuradas via builder.
+    // O builder usado (with_safe_defaults) já inclui TLS 1.2 e 1.3 por padrão.
+    // c.versions = vec![rustls::ProtocolVersion::TLSv1_2, rustls::ProtocolVersion::TLSv1_3];
     
     Ok(c)
 }
